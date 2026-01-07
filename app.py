@@ -294,7 +294,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Chill_vs_Duke Hybrid Movie Recommender API",
+    title="Hybrid Movie Recommender API",
     version="2.0",
     lifespan=lifespan,
 )
