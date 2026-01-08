@@ -10,12 +10,11 @@ import os
 
 
 # =========================
-# Config (Windows paths)
+# Config (paths via env)
 # =========================
-import os
-
 ARTIFACT_PATH = os.getenv("ARTIFACT_PATH", "Chill_vs_Duke.joblib")
 LINKS_CSV_PATH = os.getenv("LINKS_CSV_PATH", "links.csv")
+
 
 # =========================
 # Helper functions
@@ -36,7 +35,7 @@ def _minmax_norm(arr: np.ndarray) -> np.ndarray:
 
 
 def _topk_indices(scores: np.ndarray, k: int) -> np.ndarray:
-    """Return indices of top-k scores (descending). Assumes scores is 1D."""
+    """Return indices of top-k scores (descending). scores must be 1D."""
     n = int(scores.shape[0])
     k = min(int(k), n)
     if k <= 0:
@@ -73,7 +72,7 @@ class ChillVsDukeRecommender:
       - model_name (optional)
       - movie_ids, titles, genres (genres optional)
       - id2row (optional)
-      - X  (content embeddings; here Z_norm)
+      - X  (content embeddings; typically Z_norm so dot == cosine)
       - w_content, w_cf
       - ITEM_EMB_CF (optional), mid2col_cf (optional)
       - cf_item_rows_valid, cf_valid (optional)
@@ -94,7 +93,7 @@ class ChillVsDukeRecommender:
         self.titles: list[str] = list(self.A["titles"])
         self.genres: list[str] = list(self.A.get("genres", [""] * len(self.movie_ids)))
 
-        # Content embeddings: X = Z_norm (already normalized)
+        # Content embeddings: X is expected (N_movies x D)
         self.X: np.ndarray = np.asarray(self.A["X"], dtype=np.float32)
         if self.X.ndim != 2 or self.X.shape[0] != len(self.movie_ids):
             raise ValueError(f"Bad X shape: {self.X.shape} vs movies {len(self.movie_ids)}")
@@ -105,7 +104,7 @@ class ChillVsDukeRecommender:
         else:
             self.id2row = {int(mid): i for i, mid in enumerate(self.movie_ids)}
 
-        # Default weights
+        # Default weights (can be updated by PUT /config)
         self.w_content_default = float(self.A.get("w_content", 0.6))
         self.w_cf_default = float(self.A.get("w_cf", 0.4))
 
@@ -164,7 +163,7 @@ class ChillVsDukeRecommender:
         i = self.id2row[seed_movie_id]
 
         # ---- Content similarity ----
-        # X is Z_norm so dot == cosine
+        # If X is L2-normalized per row, dot == cosine similarity
         v = self.X[i]
         content_scores = (self.X @ v).astype(np.float32)
 
@@ -199,7 +198,6 @@ class ChillVsDukeRecommender:
 
         hybrid = wc * content_norm + wf * cf_norm
 
-        # hard exclude
         hybrid[i] = -np.inf
         for mid in exclude_set:
             r = self.id2row.get(mid)
@@ -282,12 +280,33 @@ class ChillVsDukeRecommender:
 
 
 # =========================
+# NEW: Server config (PUT)
+# =========================
+class RecoConfig(BaseModel):
+    default_k: int = Field(default=30, ge=1, le=50)   # ✅ default recommend 30 movies
+    default_w_content: float = 0.6
+    default_w_cf: float = 0.4
+
+class RecoConfigUpdate(BaseModel):
+    default_k: int | None = Field(default=None, ge=1, le=50)
+    default_w_content: float | None = None
+    default_w_cf: float | None = None
+
+
+# =========================
 # FastAPI app (lifespan)
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         app.state.reco = ChillVsDukeRecommender(ARTIFACT_PATH, LINKS_CSV_PATH)
+
+        # init server config (can be changed by PUT /config)
+        app.state.cfg = RecoConfig(
+            default_k=30,
+            default_w_content=float(app.state.reco.w_content_default),
+            default_w_cf=float(app.state.reco.w_cf_default),
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to initialize recommender: {e}") from e
     yield
@@ -295,7 +314,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Hybrid Movie Recommender API",
-    version="2.0",
+    version="2.1",
     lifespan=lifespan,
 )
 
@@ -307,21 +326,35 @@ def get_reco(app: FastAPI) -> ChillVsDukeRecommender:
     return reco
 
 
+def get_cfg(app: FastAPI) -> RecoConfig:
+    cfg = getattr(app.state, "cfg", None)
+    if cfg is None:
+        cfg = RecoConfig()
+        app.state.cfg = cfg
+    return cfg
+
+
 @app.get("/health")
 def health():
     reco = get_reco(app)
+    cfg = get_cfg(app)
     return {
         "status": "ok",
         "model": reco.model_name,
         "movies": int(len(reco.movie_ids)),
         "cf_ready": bool(reco.cf_ready),
         "tmdb_coverage_in_model_universe": int(reco.tmdb_coverage),
+        "config": cfg.model_dump(),
     }
 
 
+# =========================
+# Request body for recommend
+# - k is optional now: if None -> use server default_k
+# =========================
 class RecommendTMDbRequest(BaseModel):
     seed_tmdb_id: int
-    k: int = Field(default=10, ge=1, le=50)
+    k: int | None = Field(default=None, ge=1, le=50)  # ✅ optional
     exclude_tmdb_ids: list[int] = Field(default_factory=list)
     w_content: float | None = None
     w_cf: float | None = None
@@ -330,15 +363,53 @@ class RecommendTMDbRequest(BaseModel):
 @app.post("/recommend_tmdb")
 def recommend_tmdb(req: RecommendTMDbRequest):
     reco = get_reco(app)
+    cfg = get_cfg(app)
+
+    k_used = int(req.k) if req.k is not None else int(cfg.default_k)
+    w_content_used = float(req.w_content) if req.w_content is not None else float(cfg.default_w_content)
+    w_cf_used = float(req.w_cf) if req.w_cf is not None else float(cfg.default_w_cf)
+
     try:
-        return reco.recommend_by_tmdb_id(
+        res = reco.recommend_by_tmdb_id(
             seed_tmdb_id=req.seed_tmdb_id,
-            k=req.k,
+            k=k_used,
             exclude_tmdb_ids=req.exclude_tmdb_ids,
-            w_content=req.w_content,
-            w_cf=req.w_cf,
+            w_content=w_content_used,
+            w_cf=w_cf_used,
         )
+        # helpful fields so users know server used what
+        res["k_used"] = k_used
+        res["w_content_used"] = w_content_used
+        res["w_cf_used"] = w_cf_used
+        return res
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# NEW: PUT /config (update defaults)
+# =========================
+@app.put("/config")
+def update_config(req: RecoConfigUpdate):
+    reco = get_reco(app)
+    cfg = get_cfg(app)
+
+    if req.default_k is not None:
+        cfg.default_k = int(req.default_k)
+
+    if req.default_w_content is not None:
+        cfg.default_w_content = float(req.default_w_content)
+
+    if req.default_w_cf is not None:
+        cfg.default_w_cf = float(req.default_w_cf)
+
+    # also update reco defaults (so internal fallback aligns)
+    reco.w_content_default = cfg.default_w_content
+    reco.w_cf_default = cfg.default_w_cf
+
+    return {
+        "message": "Config updated",
+        "config": cfg.model_dump(),
+    }
