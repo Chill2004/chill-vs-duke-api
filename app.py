@@ -389,6 +389,128 @@ def recommend_tmdb(req: RecommendTMDbRequest):
 
 
 # =========================
+# NEW: DELETE /recommend_tmdb
+# - Remove movies from an existing recommendation list
+# - Replace with new movies so the final list length stays = k
+# =========================
+class RecommendationItem(BaseModel):
+    tmdb_id: int
+    score: float | None = None
+    movielens_movie_id: int | None = None
+    title: str | None = None
+    genres: str | None = None
+    content_norm: float | None = None
+    cf_norm: float | None = None
+    cf_available: bool | None = None
+
+
+class RecommendDeleteRequest(BaseModel):
+    seed_tmdb_id: int
+    removed_tmdb_ids: list[int] = Field(default_factory=list)
+
+    # list hiện tại mà client đang có (để server giữ nguyên order, chỉ bù thêm)
+    current_recommendations: list[RecommendationItem] = Field(default_factory=list)
+
+    # optional overrides
+    k: int | None = Field(default=None, ge=1, le=50)
+    w_content: float | None = None
+    w_cf: float | None = None
+
+
+@app.delete("/recommend_tmdb")
+def delete_from_recommendations(req: RecommendDeleteRequest):
+    reco = get_reco(app)
+    cfg = get_cfg(app)
+
+    k_used = int(req.k) if req.k is not None else int(cfg.default_k)
+    w_content_used = float(req.w_content) if req.w_content is not None else float(cfg.default_w_content)
+    w_cf_used = float(req.w_cf) if req.w_cf is not None else float(cfg.default_w_cf)
+
+    removed_set = set(int(x) for x in req.removed_tmdb_ids)
+
+    # 1) Keep old list order, remove unwanted
+    kept = [r for r in req.current_recommendations if int(r.tmdb_id) not in removed_set]
+    kept_ids = set(int(r.tmdb_id) for r in kept)
+
+    # if no current list provided -> just "remove set" doesn't mean much, return fresh list
+    if len(req.current_recommendations) == 0:
+        try:
+            res = reco.recommend_by_tmdb_id(
+                seed_tmdb_id=req.seed_tmdb_id,
+                k=k_used,
+                exclude_tmdb_ids=list(removed_set),
+                w_content=w_content_used,
+                w_cf=w_cf_used,
+            )
+            res["mode"] = "fresh_recommend_excluding_removed"
+            res["removed_tmdb_ids"] = sorted(list(removed_set))
+            res["k_used"] = k_used
+            return res
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 2) Need to fill missing slots
+    need = max(0, k_used - len(kept))
+
+    if need == 0:
+        return {
+            "mode": "edited_existing_list",
+            "seed_tmdb_id": int(req.seed_tmdb_id),
+            "k_used": k_used,
+            "removed_tmdb_ids": sorted(list(removed_set)),
+            "recommendations": [r.model_dump() for r in kept[:k_used]],
+        }
+
+    # 3) Generate new candidates excluding:
+    #    - removed movies
+    #    - already kept movies
+    #    (so we can safely append new ones)
+    exclude_for_fill = sorted(list(removed_set | kept_ids))
+
+    # oversample to ensure enough candidates after filtering
+    oversample = min(max(k_used * 8, 120), 400)
+
+    try:
+        pool = reco.recommend_by_tmdb_id(
+            seed_tmdb_id=req.seed_tmdb_id,
+            k=oversample,
+            exclude_tmdb_ids=exclude_for_fill,
+            w_content=w_content_used,
+            w_cf=w_cf_used,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 4) Append new movies until we have k_used
+    fill = []
+    for cand in pool.get("recommendations", []):
+        tid = int(cand["tmdb_id"])
+        if tid in removed_set or tid in kept_ids:
+            continue
+        fill.append(cand)
+        if len(fill) >= need:
+            break
+
+    final_list = [r.model_dump() for r in kept] + fill
+    final_list = final_list[:k_used]
+
+    return {
+        "mode": "edited_existing_list",
+        "seed_tmdb_id": int(req.seed_tmdb_id),
+        "k_used": k_used,
+        "removed_tmdb_ids": sorted(list(removed_set)),
+        "kept_count": int(len(kept)),
+        "filled_count": int(len(final_list) - len(kept)),
+        "recommendations": final_list,
+        "w_content_used": w_content_used,
+        "w_cf_used": w_cf_used,
+    }
+
+# =========================
 # NEW: PUT /config (update defaults)
 # =========================
 @app.put("/config")
